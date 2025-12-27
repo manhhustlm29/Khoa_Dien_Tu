@@ -10,51 +10,21 @@
 #include <PubSubClient.h>
 #include <time.h>
 
-// ---------- Pin mapping ----------
+// ==========================================
+// 1. CẤU HÌNH PHẦN CỨNG
+// ==========================================
 #define RC522_SS   5
 #define RC522_RST  25
 #define OLED_SDA   21
 #define OLED_SCL   22
-#define FINGER_RX_PIN 16
-#define FINGER_TX_PIN 17
-
-// ---------- OLED ----------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#define FINGER_RX_PIN 16 
+#define FINGER_TX_PIN 17 
 
-// ---------- RFID ----------
-MFRC522 mfrc522(RC522_SS, RC522_RST);
-
-// ---------- Fingerprint ----------
-Adafruit_Fingerprint finger(&Serial2);
-
-// ---------- EEPROM layout ----------
-#define EEPROM_SIZE 512
-
-// Byte đầu: số lượng user
-#define COUNT_ADDR 0
-
-// Mật khẩu: 4 ký tự + '\0' (5 byte) — giữ nguyên ở byte 1..5
-#define PASSWORD_ADDR 1
-#define PASSWORD_LEN 5   // 4 số + null
-
-// Danh sách user bắt đầu tại byte 6
-#define RECORDS_START 6
-
-// Thông tin người dùng
-#define NAME_MAX_LEN 20   // tên tối đa 20 byte
-#define UID_LEN 4         // UID RFID chuẩn 4 byte
-
-#define RECORD_SIZE (UID_LEN + NAME_MAX_LEN)
-
-// Số lượng user tối đa (tự tính)
-#define MAX_USERS ((EEPROM_SIZE - RECORDS_START) / RECORD_SIZE)
-
-
-// ---------- Keypad ----------
-const byte ROWS = 5;
-const byte COLS = 4;
+// Keypad
+const byte ROWS = 5; 
+const byte COLS = 4; 
 char keys[ROWS][COLS] = {
   {'A','B','#','*'},
   {'1','2','3','U'},
@@ -62,70 +32,78 @@ char keys[ROWS][COLS] = {
   {'7','8','9','C'},
   {'L','0','R','E'}
 };
-byte rowPins[ROWS] = {13,12,14,27,26};
-byte colPins[COLS] = {15,4,32,33};
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+byte rowPins[ROWS] = {13, 12, 14, 27, 26}; 
+byte colPins[COLS] = {15, 4, 32, 33};
 
-// ---------- WiFi & MQTT ----------
-const char* ssid = "VILLA KT 301";
+// ==========================================
+// 2. CONFIG WIFI & MQTT
+// ==========================================
+const char* ssid          = "VILLA KT 301";
 const char* wifi_password = "buong301@";
-const char* mqtt_server = "test.mosquitto.org";
-const int mqtt_port = 1883;
-const char* mqtt_topic = "esp32/lock";
-const char* mqtt_rfid_add_topic = "esp32/rfid_add";             // app -> esp: payload = name
-const char* mqtt_rfid_add_result = "esp32/rfid_add_result";     // esp -> app: json result
+const char* mqtt_server   = "test.mosquitto.org";
+const int   mqtt_port     = 1883;
 
+// Topics
+const char* mqtt_topic            = "esp32/lock";
+const char* mqtt_rfid_add_topic   = "esp32/rfid_add";
+const char* mqtt_finger_add_topic = "esp32/finger_add"; 
+const char* mqtt_rfid_add_result  = "esp32/rfid_add_result";
+
+// ==========================================
+// 3. EEPROM LAYOUT
+// ==========================================
+#define EEPROM_SIZE 512
+#define COUNT_ADDR 0
+#define PASSWORD_ADDR 1
+#define PASSWORD_LEN 5 
+#define RECORDS_START 6
+#define UID_LEN 4
+#define RECORD_SIZE UID_LEN
+#define MAX_USERS ((EEPROM_SIZE - RECORDS_START) / RECORD_SIZE)
+
+// ==========================================
+// 4. OBJECTS & GLOBALS
+// ==========================================
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+MFRC522 mfrc522(RC522_SS, RC522_RST);
+Adafruit_Fingerprint finger(&Serial2);
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// ---------- Flags ----------
 volatile bool wifiConnected = false;
 volatile bool mqttConnected = false;
-volatile bool addMode = false;       // true when waiting to add UID from app command
-String pendingAddName = "";          // name provided by app to associate with next scanned tag
+volatile bool addMode = false;       // RFID Add Flag
+volatile bool addFingerMode = false; // Finger Add Flag
+String correctPassword = "1234";
 
-// ---------- FreeRTOS objects ----------
 SemaphoreHandle_t displayMutex = NULL;
-QueueHandle_t mqttQueue = NULL; // queue of messages to send to MQTT
+QueueHandle_t mqttQueue = NULL;
+struct MQMsg { char txt[128]; };
 
-// ---------- Password ----------
-String passwordInput = "";
-String correctPassword = "1234"; // will be loaded from EEPROM at setup
-volatile bool changePassMode = false; // true when in change-pass flow
-String newPassBuffer = ""; // used as state marker during change
+// ==========================================
+// 5. HELPER FUNCTIONS
+// ==========================================
 
-// ---------- MQTT message struct ----------
-struct MQMsg {
-  char txt[128];
-};
-
-// ---------- Helper functions for EEPROM users ----------
+// --- EEPROM ---
 int getUserCount() {
   uint8_t c = EEPROM.read(COUNT_ADDR);
-  if (c == 0xFF) return 0; // erased state
+  if (c == 0xFF || c > MAX_USERS) return 0;
   return (int)c;
 }
 
 void setUserCount(int n) {
-  if (n < 0) n = 0;
-  if (n > MAX_USERS) n = MAX_USERS;
+  if (n < 0) n = 0; if (n > MAX_USERS) n = MAX_USERS;
   EEPROM.write(COUNT_ADDR, (uint8_t)n);
   EEPROM.commit();
 }
 
-void readUserRecord(int index, byte outUID[UID_LEN], char outName[NAME_MAX_LEN+1]) {
+void readUserUID(int index, byte outUID[UID_LEN]) {
   memset(outUID, 0, UID_LEN);
-  outName[0] = 0;
   int total = getUserCount();
   if (index < 0 || index >= total) return;
   int base = RECORDS_START + index * RECORD_SIZE;
   for (int i = 0; i < UID_LEN; i++) outUID[i] = EEPROM.read(base + i);
-  for (int i = 0; i < NAME_MAX_LEN; i++) {
-    uint8_t c = EEPROM.read(base + UID_LEN + i);
-    if (c == 0xFF || c == 0) { outName[i] = 0; break; }
-    outName[i] = (char)c;
-    if (i == NAME_MAX_LEN-1) outName[NAME_MAX_LEN] = 0;
-  }
 }
 
 bool uidEquals(const byte a[UID_LEN], const byte b[UID_LEN]) {
@@ -133,542 +111,371 @@ bool uidEquals(const byte a[UID_LEN], const byte b[UID_LEN]) {
   return true;
 }
 
-String uidToHexString(const byte uid[UID_LEN], byte len = UID_LEN) {
+String uidToHexString(const byte uid[UID_LEN]) {
   String s = "";
-  for (byte i = 0; i < len; i++) {
-    if (uid[i] < 0x10) s += "0";
-    s += String(uid[i], HEX);
+  for (byte i = 0; i < UID_LEN; i++) {
+    if (uid[i] < 0x10) s += "0"; s += String(uid[i], HEX);
   }
-  s.toUpperCase();
-  return s;
+  s.toUpperCase(); return s;
 }
 
-// check if uid already exists and return index, or -1
 int findUserIndexByUID(const byte uid[UID_LEN]) {
   int n = getUserCount();
   for (int i = 0; i < n; i++) {
-    byte u[UID_LEN];
-    char nm[NAME_MAX_LEN+1];
-    readUserRecord(i, u, nm);
+    byte u[UID_LEN]; readUserUID(i, u);
     if (uidEquals(u, uid)) return i;
   }
   return -1;
 }
 
-// save a new user (append). returns index saved or -1 on error (full)
-int saveUser(const byte uid[UID_LEN], const String &name) {
+int saveUser(const byte uid[UID_LEN]) {
   int n = getUserCount();
   if (n >= MAX_USERS) return -1;
   int base = RECORDS_START + n * RECORD_SIZE;
-  // write UID
   for (int i = 0; i < UID_LEN; i++) EEPROM.write(base + i, uid[i]);
-  // write name (truncated to NAME_MAX_LEN)
-  for (int i = 0; i < NAME_MAX_LEN; i++) {
-    if (i < name.length()) EEPROM.write(base + UID_LEN + i, (uint8_t)name[i]);
-    else EEPROM.write(base + UID_LEN + i, 0);
-  }
-  setUserCount(n + 1);
-  EEPROM.commit();
+  setUserCount(n + 1); EEPROM.commit();
   return n;
 }
 
-// ---------- Password EEPROM helpers ----------
-void loadPasswordFromEEPROM() {
+// --- PASSWORD ---
+void loadPassword() {
   char buf[PASSWORD_LEN + 1];
   for (int i = 0; i < PASSWORD_LEN; i++) {
     uint8_t v = EEPROM.read(PASSWORD_ADDR + i);
-    if (v == 0xFF) buf[i] = 0;
-    else buf[i] = (char)v;
+    buf[i] = (v == 0xFF) ? 0 : (char)v;
   }
   buf[PASSWORD_LEN] = 0;
   String p = String(buf);
-  if (p.length() == 0) {
-    correctPassword = "1234"; // fallback default
-  } else {
-    correctPassword = p;
-  }
-  Serial.print("Loaded password: ");
-  Serial.println(correctPassword);
+  correctPassword = (p.length() > 0) ? p : "1234";
+  Serial.println("Loaded Pass: " + correctPassword);
 }
 
-void savePasswordToEEPROM(const String &pass) {
-  // write up to PASSWORD_LEN bytes (including null)
-  for (int i = 0; i < PASSWORD_LEN; i++) {
-    if (i < pass.length()) EEPROM.write(PASSWORD_ADDR + i, pass[i]);
-    else EEPROM.write(PASSWORD_ADDR + i, 0);
-  }
+void savePassword(const String &pass) {
+  for (int i = 0; i < PASSWORD_LEN; i++) EEPROM.write(PASSWORD_ADDR + i, (i < pass.length()) ? pass[i] : 0);
   EEPROM.commit();
-  Serial.print("Saved password: ");
-  Serial.println(pass);
+  correctPassword = pass;
 }
 
-// ---------- Other helpers ----------
+// --- SYSTEM ---
 String getTimestamp() {
-  struct tm timeinfo;
-  char buf[30];
-  if (getLocalTime(&timeinfo)) {
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  } else {
-    snprintf(buf, sizeof(buf), "uptime_%lus", millis() / 1000);
-  }
+  struct tm timeinfo; char buf[30];
+  if (getLocalTime(&timeinfo)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  else snprintf(buf, sizeof(buf), "uptime_%lus", millis() / 1000);
   return String(buf);
 }
 
-// Push message into mqttQueue (non-blocking). If queue full, prints to Serial.
 void queueMessage(const String &s) {
-  if (!mqttQueue) {
-    Serial.println("MQ queue not initialized");
-    return;
-  }
-  MQMsg m;
-  memset(m.txt, 0, sizeof(m.txt));
-  size_t n = s.length();
-  if (n >= sizeof(m.txt)) n = sizeof(m.txt) - 1;
+  if (!mqttQueue) return;
+  MQMsg m; memset(m.txt, 0, sizeof(m.txt));
+  size_t n = s.length(); if (n >= sizeof(m.txt)) n = sizeof(m.txt) - 1;
   memcpy(m.txt, s.c_str(), n);
-  if (xQueueSend(mqttQueue, &m, 0) != pdTRUE) {
-    Serial.println("MQ queue full, offline log: " + s);
-  }
+  xQueueSend(mqttQueue, &m, 0);
 }
 
-// Display helpers with mutex protection
-void safeDisplayClearAndPrint(const String &line1, const String &line2 = "") {
+void safeDisplay(const String &line1, const String &line2 = "") {
   if (displayMutex && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(200))) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
+    display.clearDisplay(); display.setTextSize(1); display.setCursor(0, 0);
     display.println(line1);
-    if (line2.length()) {
-      display.println(line2);
-    }
-    display.display();
-    xSemaphoreGive(displayMutex);
-  } else {
-    Serial.println("Display busy - " + line1 + " / " + line2);
+    if (line2.length()) { display.setCursor(0, 16); display.println(line2); }
+    display.display(); xSemaphoreGive(displayMutex);
   }
 }
 
-void postShowDelay() {
+void showReady() {
   vTaskDelay(pdMS_TO_TICKS(1500));
-  safeDisplayClearAndPrint("Ready to scan:", "- RFID / Finger / Keypad");
+  safeDisplay("READY TO SCAN", "RFID / Finger / Pass");
 }
 
-// ---------- WiFi ----------
+// ==========================================
+// 6. WIFI & MQTT & CALLBACK
+// ==========================================
 void setup_wifi() {
-  Serial.println("Connecting WiFi...");
+  Serial.print("WiFi Connecting");
   WiFi.begin(ssid, wifi_password);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    vTaskDelay(pdMS_TO_TICKS(250));
-    Serial.print(".");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    vTaskDelay(pdMS_TO_TICKS(250)); Serial.print("."); retry++;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
-    safeDisplayClearAndPrint("WiFi: CONNECTED", WiFi.localIP().toString());
+    wifiConnected = true; Serial.println("\nWiFi OK");
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
+    safeDisplay("WiFi: OK", WiFi.localIP().toString());
   } else {
-    wifiConnected = false;
-    Serial.println("\nWiFi not connected — OFFLINE MODE");
-    safeDisplayClearAndPrint("WiFi: OFFLINE", "Ready to scan:");
+    wifiConnected = false; Serial.println("\nWiFi Fail");
+    safeDisplay("WiFi: ERROR", "Offline Mode");
   }
 }
 
-// ---------- NTP ----------
-void setup_time() {
-  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com");
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 5000)) {
-    Serial.println("NTP time OK");
-  } else {
-    Serial.println("NTP time fail");
-  }
-}
-
-// ---------- MQTT callback ----------
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // 1. Tạo biến msg từ payload (ĐÃ SỬA LỖI Ở ĐÂY)
   String msg = "";
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   String t = String(topic);
 
+  // 2. Xử lý logic
   if (t == mqtt_rfid_add_topic) {
-    // payload expected: name (plain text). We'll set addMode and wait for next RFID scan.
-    pendingAddName = msg;
     addMode = true;
-    Serial.println("Add request received. Name: " + pendingAddName);
-    safeDisplayClearAndPrint("ADD MODE: Scan tag", pendingAddName);
-    // Optionally send ack back
-    String ack = "{\"status\":\"waiting_for_tag\",\"name\":\"" + pendingAddName + "\"}";
-    client.publish(mqtt_rfid_add_result, ack.c_str());
+    Serial.println("CMD: Add User Mode ON");
+    safeDisplay("ADD MODE ON", "Moi quet the...");
+    if (client.connected()) client.publish(mqtt_rfid_add_result, "{\"status\":\"waiting_tag\"}");
+  }
+  else if (t == mqtt_finger_add_topic) {
+     if (msg == "CMD_ADD_FINGER") {
+        addFingerMode = true; 
+        Serial.println("LENH: Them Van Tay");
+        safeDisplay("ADD MODE ON", "Moi them van tay...");
+     }
   }
 }
 
-// ---------- MQTT reconnect (non-blocking style) ----------
-void mqttConnectOnce() {
-  if (!wifiConnected) { mqttConnected = false; return; }
-  if (client.connected()) { mqttConnected = true; return; }
-
-  Serial.print("Connecting MQTT...");
-  String clientId = "ESP32Client-" + String((uint16_t)random(0xffff), HEX);
+void reconnectMQTT() {
+  if (!wifiConnected) return;
+  if (client.connected()) return;
+  
+  String clientId = "ESP32Lock-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   if (client.connect(clientId.c_str())) {
-    mqttConnected = true;
-    Serial.println("MQTT connected");
-    safeDisplayClearAndPrint("MQTT: CONNECTED", mqtt_server);
+    mqttConnected = true; Serial.println("MQTT OK");
     client.subscribe(mqtt_rfid_add_topic);
+    client.subscribe(mqtt_finger_add_topic); // Đừng quên subscribe topic này
+    safeDisplay("MQTT: Connected", "");
   } else {
     mqttConnected = false;
-    Serial.print("MQTT connect fail rc=");
-    Serial.println(client.state());
+    Serial.print("MQTT Fail rc="); Serial.println(client.state());
   }
 }
 
-// ---------- Task prototypes ----------
-void TaskRFID(void *pvParameters);
-void TaskFinger(void *pvParameters);
-void TaskKeypad(void *pvParameters);
-void TaskMQTT(void *pvParameters);
-
-// ---------- Keypad handling (used inside keypad task) ----------
-void handleKeypadInternal() {
-  char key = keypad.getKey();
-  if (!key) return;
-
-  // If user pressed A -> enter change password flow
-  if (key == 'A') {
-    passwordInput = "";
-    newPassBuffer = ""; // expect old pass next
-    changePassMode = true;
-    safeDisplayClearAndPrint("Doi mat khau:", "Nhap pass cu");
-    return;
+// ==========================================
+// 7. FINGERPRINT LOGIC (ENROLLMENT)
+// ==========================================
+int getNextFreeID() {
+  for (int i = 1; i <= 127; i++) {
+    uint8_t p = finger.loadModel(i);
+    if (p != FINGERPRINT_OK) return i; 
   }
-
-  // Only accept digits for password entry
-  if (key >= '0' && key <= '9') {
-    // limit to PASSWORD_LEN - 1 digits (4 digits)
-    if (passwordInput.length() < (PASSWORD_LEN - 1)) passwordInput += key;
-  } else if (key == 'C') {
-    passwordInput = "";
-    // cancel change pass if user clears
-    if (changePassMode) {
-      changePassMode = false;
-      newPassBuffer = "";
-      postShowDelay();
-      return;
-    }
-  } else if (key == 'E') {
-    // If we are in change password flow
-    if (changePassMode) {
-      // Step 1: verify old password
-      if (newPassBuffer == "") {
-        // require exactly 4 digits to verify
-        if (passwordInput.length() != (PASSWORD_LEN - 1)) {
-          safeDisplayClearAndPrint("Nhap 4 so", "Nhap lai");
-          passwordInput = "";
-          vTaskDelay(pdMS_TO_TICKS(1200));
-          safeDisplayClearAndPrint("Doi mat khau:", "Nhap pass cu");
-          return;
-        }
-
-        if (passwordInput == correctPassword) {
-          newPassBuffer = "OK"; // mark that old pass verified
-          passwordInput = "";
-          safeDisplayClearAndPrint("Doi mat khau:", "Nhap pass moi");
-        } else {
-          safeDisplayClearAndPrint("Sai pass cu", "Quay ve... ");
-          changePassMode = false;
-          newPassBuffer = "";
-          passwordInput = "";
-          vTaskDelay(pdMS_TO_TICKS(1200));
-          postShowDelay();
-        }
-      }
-      // Step 2: save new password
-      else {
-        // ensure new password is 4 digits
-        if (passwordInput.length() != (PASSWORD_LEN - 1)) {
-          safeDisplayClearAndPrint("Pass phai 4 so", "");
-          passwordInput = "";
-          vTaskDelay(pdMS_TO_TICKS(1200));
-          safeDisplayClearAndPrint("Doi mat khau:", "Nhap pass moi");
-          return;
-        }
-        // persist to EEPROM (bytes 1..5)
-        correctPassword = passwordInput;
-        savePasswordToEEPROM(correctPassword);
-        safeDisplayClearAndPrint("Luu thanh cong", "");
-        changePassMode = false;
-        newPassBuffer = "";
-        passwordInput = "";
-        vTaskDelay(pdMS_TO_TICKS(1200));
-        postShowDelay();
-      }
-      return;
-    }
-
-    // Normal verify flow (not changing password)
-    // require exactly 4 digits for normal verify as well
-    if (passwordInput.length() != (PASSWORD_LEN - 1)) {
-      safeDisplayClearAndPrint("Nhap 4 so", "");
-      vTaskDelay(pdMS_TO_TICKS(900));
-      passwordInput = "";
-      postShowDelay();
-      return;
-    }
-
-    if (passwordInput == correctPassword) {
-      safeDisplayClearAndPrint("PASS OK", "");
-      String ts = getTimestamp();
-      String msg = "PASSWORD unlock " + ts;
-      queueMessage(msg);
-    } else {
-      safeDisplayClearAndPrint("SAI PASS", "");
-    }
-    vTaskDelay(pdMS_TO_TICKS(1200));
-    passwordInput = "";
-    postShowDelay();
-    return;
-  }
-
-  // show password masked
-  if (displayMutex && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(200))) {
-    display.clearDisplay();
-    display.setTextSize(1); display.setCursor(0, 0);
-    if (changePassMode) {
-      if (newPassBuffer == "") display.println("Doi mat khau: (nhap cu)");
-      else display.println("Doi mat khau: (nhap moi)");
-    } else display.println("Nhap mat khau:");
-    display.setTextSize(2); display.setCursor(0, 20);
-    for (unsigned int i = 0; i < passwordInput.length(); i++) display.print('*');
-    display.display();
-    xSemaphoreGive(displayMutex);
-  }
+  return -1; 
 }
 
-// ---------- Tasks ----------
-
-// RFID Task
-void TaskRFID(void *pvParameters) {
-  (void) pvParameters;
-  for (;;) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      byte readUID[UID_LEN] = {0};
-      for (byte i = 0; i < UID_LEN && i < mfrc522.uid.size; i++) readUID[i] = mfrc522.uid.uidByte[i];
-
-      if (addMode) {
-        // Add user flow
-        int existing = findUserIndexByUID(readUID);
-        if (existing >= 0) {
-          // already exists -> update name in place
-          int base = RECORDS_START + existing * RECORD_SIZE;
-          for (int i = 0; i < NAME_MAX_LEN; i++) {
-            if (i < pendingAddName.length()) EEPROM.write(base + UID_LEN + i, (uint8_t)pendingAddName[i]);
-            else EEPROM.write(base + UID_LEN + i, 0);
-          }
-          EEPROM.commit();
-          // publish result
-          String idHex = uidToHexString(readUID, UID_LEN);
-          String out = "{\"status\":\"updated\",\"uid\":\"" + idHex + "\",\"name\":\"" + pendingAddName + "\"}";
-          if (client.connected()) client.publish(mqtt_rfid_add_result, out.c_str());
-          safeDisplayClearAndPrint("Cập nhật user", pendingAddName);
-        } else {
-          int idx = saveUser(readUID, pendingAddName);
-          if (idx >= 0) {
-            String idHex = uidToHexString(readUID, UID_LEN);
-            String out = "{\"status\":\"ok\",\"uid\":\"" + idHex + "\",\"name\":\"" + pendingAddName + "\"}";
-            if (client.connected()) client.publish(mqtt_rfid_add_result, out.c_str());
-            safeDisplayClearAndPrint("Added user:", pendingAddName);
-          } else {
-            String out = "{\"status\":\"full\",\"msg\":\"EEPROM full\"}";
-            if (client.connected()) client.publish(mqtt_rfid_add_result, out.c_str());
-            safeDisplayClearAndPrint("EEPROM FULL", "");
-          }
-        }
-        // clear add mode
-        addMode = false;
-        pendingAddName = "";
-        vTaskDelay(pdMS_TO_TICKS(800));
-        postShowDelay();
-      } else {
-        // Normal unlock check across all users
-        int idx = findUserIndexByUID(readUID);
-        if (displayMutex && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(200))) {
-          display.clearDisplay();
-          display.setTextSize(2);
-          display.setCursor(0, 16);
-          if (idx >= 0) {
-            char nm[NAME_MAX_LEN+1];
-            byte u[UID_LEN];
-            readUserRecord(idx, u, nm);
-            display.println("RFID: OK");
-            display.setTextSize(1);
-            display.println(nm);
-          } else {
-            display.println("RFID: KHONG");
-          }
-          display.display();
-          xSemaphoreGive(displayMutex);
-        } else {
-          Serial.println("Display busy - RFID result");
-        }
-
-        String idHex = uidToHexString(readUID, UID_LEN);
-        if (idx >= 0) {
-          char nm[NAME_MAX_LEN+1]; byte u[UID_LEN];
-          readUserRecord(idx, u, nm);
-          String msg = "RFID " + idHex + " unlock " + String(nm) + " " + getTimestamp();
-          queueMessage(msg);
-        }
-      }
-
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-      vTaskDelay(pdMS_TO_TICKS(600));
-      postShowDelay();
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-}
-
-// Fingerprint Task (uses getFingerprintID helper)
-int getFingerprintID() {
+int getFingerID() {
   uint8_t p = finger.getImage();
-  if (p == FINGERPRINT_NOFINGER) return -2;
-  if (p != FINGERPRINT_OK) return -2;
+  if (p != FINGERPRINT_OK) return -1;
   p = finger.image2Tz();
-  if (p != FINGERPRINT_OK) return -2;
+  if (p != FINGERPRINT_OK) return -1;
   p = finger.fingerFastSearch();
   if (p == FINGERPRINT_OK) return finger.fingerID;
   return -1;
 }
 
+void enrollFingerFlow() {
+  int id = getNextFreeID();
+  if (id == -1) {
+    client.publish(mqtt_rfid_add_result, "{\"status\":\"full\",\"msg\":\"Finger Full\"}");
+    safeDisplay("FULL FINGER", ""); addFingerMode = false; return;
+  }
+
+  safeDisplay("THEM VAN TAY", "Dat ngon tay lan 1");
+  client.publish(mqtt_rfid_add_result, "{\"status\":\"step1\",\"msg\":\"Place finger\"}");
+
+  int p = -1; unsigned long start = millis();
+  while (p != FINGERPRINT_OK) {
+    if (millis() - start > 10000) { safeDisplay("Timeout", ""); addFingerMode=false; return; }
+    p = finger.getImage(); vTaskDelay(100);
+  }
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) { safeDisplay("Loi hinh anh", ""); addFingerMode=false; return; }
+
+  safeDisplay("NHA TAY RA", "Lay tay ra...");
+  client.publish(mqtt_rfid_add_result, "{\"status\":\"step2\",\"msg\":\"Remove finger\"}");
+  vTaskDelay(2000);
+  
+  while (finger.getImage() != FINGERPRINT_NOFINGER) { vTaskDelay(50); }
+
+  safeDisplay("XAC NHAN LAI", "Dat lai lan 2");
+  client.publish(mqtt_rfid_add_result, "{\"status\":\"step3\",\"msg\":\"Place again\"}");
+  
+  p = -1; start = millis();
+  while (p != FINGERPRINT_OK) {
+    if (millis() - start > 10000) { safeDisplay("Timeout", ""); addFingerMode=false; return; }
+    p = finger.getImage(); vTaskDelay(100);
+  }
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) { safeDisplay("Loi hinh anh", ""); addFingerMode=false; return; }
+
+  p = finger.createModel();
+  if (p == FINGERPRINT_OK) {
+    p = finger.storeModel(id);
+    if (p == FINGERPRINT_OK) {
+      safeDisplay("THEM THANH CONG", "ID: " + String(id));
+      String json = "{\"status\":\"success\",\"type\":\"finger\",\"id\":\"" + String(id) + "\"}";
+      client.publish(mqtt_rfid_add_result, json.c_str());
+    } else safeDisplay("LOI LUU TRU", "");
+  } else {
+    safeDisplay("KHONG KHOP", "Thu lai");
+    client.publish(mqtt_rfid_add_result, "{\"status\":\"fail\",\"msg\":\"Mismatch\"}");
+  }
+  
+  addFingerMode = false; vTaskDelay(2000); showReady();
+}
+
+// ==========================================
+// 8. TASKS
+// ==========================================
+
+void TaskRFID(void *pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      byte readUID[UID_LEN];
+      for (byte i = 0; i < UID_LEN; i++) readUID[i] = mfrc522.uid.uidByte[i];
+      String idHex = uidToHexString(readUID);
+
+      if (addMode) {
+        int exist = findUserIndexByUID(readUID);
+        if (exist >= 0) {
+          safeDisplay("The da ton tai!", idHex);
+          String out = "{\"status\":\"exist\",\"uid\":\"" + idHex + "\"}";
+          if(client.connected()) client.publish(mqtt_rfid_add_result, out.c_str());
+        } else {
+          int idx = saveUser(readUID);
+          if (idx >= 0) {
+            safeDisplay("Luu thanh cong", idHex);
+            String out = "{\"status\":\"success\",\"uid\":\"" + idHex + "\"}";
+            if(client.connected()) client.publish(mqtt_rfid_add_result, out.c_str());
+          } else {
+            safeDisplay("EEPROM FULL", "");
+            if(client.connected()) client.publish(mqtt_rfid_add_result, "{\"status\":\"full\"}");
+          }
+        }
+        addMode = false; showReady();
+      } else {
+        int idx = findUserIndexByUID(readUID);
+        if (idx >= 0) {
+          safeDisplay("UNLOCK OK", "ID: " + idHex);
+          String msg = "RFID " + idHex + " unlock " + getTimestamp();
+          queueMessage(msg);
+        } else {
+          safeDisplay("ACCESS DENIED", "ID: " + idHex);
+        }
+        showReady();
+      }
+      mfrc522.PICC_HaltA(); mfrc522.PCD_StopCrypto1();
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 void TaskFinger(void *pvParameters) {
   (void) pvParameters;
   for (;;) {
-    int f_id = getFingerprintID();
-    if (f_id >= 0) {
-      if (displayMutex && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(200))) {
-        display.clearDisplay();
-        display.setTextSize(2); display.setCursor(0, 8);
-        display.print("Finger ID "); display.println(f_id);
-        display.display();
-        xSemaphoreGive(displayMutex);
-      }
-      String msg = "Finger ID " + String(f_id) + " unlock " + getTimestamp();
-      queueMessage(msg);
-      vTaskDelay(pdMS_TO_TICKS(800));
-      postShowDelay();
+    if (addFingerMode) {
+      enrollFingerFlow(); 
     } else {
-      vTaskDelay(pdMS_TO_TICKS(150));
+      int fid = getFingerID();
+      if (fid >= 0) {
+        safeDisplay("FINGER OK", "ID: " + String(fid));
+        String msg = "FINGER " + String(fid) + " unlock " + getTimestamp();
+        queueMessage(msg);
+        showReady();
+      }
     }
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
-// Keypad Task
 void TaskKeypad(void *pvParameters) {
   (void) pvParameters;
+  String input = ""; bool changingPass = false; String oldPassCheck = "";
+
   for (;;) {
-    handleKeypadInternal();
-    vTaskDelay(pdMS_TO_TICKS(80));
+    char key = keypad.getKey();
+    if (key) {
+      if (key == 'A') { 
+        changingPass = true; input = ""; oldPassCheck = "";
+        safeDisplay("DOI MAT KHAU", "Nhap pass cu:");
+      } 
+      else if (key == 'C') { input = ""; changingPass = false; showReady(); }
+      else if (key >= '0' && key <= '9') {
+        if (input.length() < 4) input += key;
+        if (displayMutex && xSemaphoreTake(displayMutex, 100)) {
+          display.clearDisplay(); display.setCursor(0,0);
+          display.println(changingPass ? "DOI MAT KHAU" : "NHAP MAT KHAU");
+          display.setCursor(0,16); for(unsigned int i=0; i<input.length(); i++) display.print("*");
+          display.display(); xSemaphoreGive(displayMutex);
+        }
+      }
+      else if (key == 'E') {
+        if (input.length() != 4) { safeDisplay("LOI: Phai 4 so", ""); input = ""; continue; }
+        if (changingPass) {
+          if (oldPassCheck == "") {
+             if (input == correctPassword) {
+               oldPassCheck = "OK"; input = ""; safeDisplay("Pass cu OK", "Nhap pass moi:");
+             } else {
+               safeDisplay("Sai pass cu", ""); changingPass = false; showReady();
+             }
+          } else {
+            savePassword(input); safeDisplay("Luu thanh cong", ""); changingPass = false; showReady();
+          }
+        } else {
+          if (input == correctPassword) {
+            safeDisplay("PASSWORD OK", ""); queueMessage("PASSWORD unlock " + getTimestamp());
+          } else safeDisplay("WRONG PASSWORD", "");
+          input = ""; showReady();
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-// MQTT Task - consumes queue and publishes
 void TaskMQTT(void *pvParameters) {
   (void) pvParameters;
   MQMsg recv;
   for (;;) {
-    // ensure wifi
-    if (!wifiConnected) {
-      if (WiFi.status() != WL_CONNECTED) {
-        setup_wifi();
-        if (wifiConnected) setup_time();
-      } else {
-        wifiConnected = true;
-      }
+    if (!wifiConnected && WiFi.status() == WL_CONNECTED) wifiConnected = true;
+    if (wifiConnected && !client.connected()) reconnectMQTT();
+    if (client.connected()) client.loop();
+    if (xQueueReceive(mqttQueue, &recv, pdMS_TO_TICKS(100)) == pdTRUE) {
+       if (client.connected()) client.publish(mqtt_topic, recv.txt);
     }
-
-    // ensure mqtt
-    if (wifiConnected) mqttConnectOnce();
-
-    if (client.connected()) {
-      client.loop();
-    }
-
-    // publish queued messages
-    if (mqttQueue && xQueueReceive(mqttQueue, &recv, pdMS_TO_TICKS(500)) == pdTRUE) {
-      String s = String(recv.txt);
-      if (wifiConnected && client.connected()) {
-        boolean ok = client.publish(mqtt_topic, recv.txt);
-        if (ok) {
-          Serial.println("Published: " + s);
-        } else {
-          Serial.println("Publish failed, offline log: " + s);
-        }
-      } else {
-        Serial.println("Offline log: " + s);
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
 
-// ---------- Setup ----------
+// ==========================================
+// 9. SETUP & LOOP
+// ==========================================
 void setup() {
   Serial.begin(115200);
-  delay(100);
-
-  // init EEPROM
   EEPROM.begin(EEPROM_SIZE);
 
-  // init display
+  if (EEPROM.read(COUNT_ADDR) > MAX_USERS) {
+    Serial.println("EEPROM garbage detected. Resetting."); setUserCount(0);
+  }
+
   Wire.begin(OLED_SDA, OLED_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED not found! Stopping.");
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { Serial.println("OLED Fail"); for(;;); }
+  display.clearDisplay(); display.setTextColor(WHITE); display.display();
 
-  // create mutex & queue
-  displayMutex = xSemaphoreCreateMutex();
-  mqttQueue = xQueueCreate(8, sizeof(MQMsg)); // 8 messages, each 128 bytes
-
-  // basic init messages
-  if (displayMutex) {
-    xSemaphoreTake(displayMutex, pdMS_TO_TICKS(200));
-    display.setTextSize(1); display.setCursor(0, 0);
-    display.println("Init system...");
-    display.display();
-    xSemaphoreGive(displayMutex);
-  }
-
-  // init devices
   SPI.begin(); mfrc522.PCD_Init();
+  
   Serial2.begin(57600, SERIAL_8N1, FINGER_RX_PIN, FINGER_TX_PIN);
   finger.begin(57600);
+  if (finger.verifyPassword()) Serial.println("Finger OK");
+  else Serial.println("Finger Fail");
 
-  if (finger.verifyPassword()) Serial.println("Fingerprint sensor found!");
-  else Serial.println("Fingerprint sensor not found!");
+  displayMutex = xSemaphoreCreateMutex();
+  mqttQueue = xQueueCreate(10, sizeof(MQMsg));
 
-  // load password from EEPROM (bytes 1..5)
-  loadPasswordFromEEPROM();
-
-  // wifi + mqtt setup (non-blocking)
+  loadPassword();
   setup_wifi();
-  if (wifiConnected) setup_time();
-
+  
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);
 
-  // show ready
-  safeDisplayClearAndPrint("Ready to scan:", "- RFID / Finger / Keypad");
-
-  // create tasks
-  xTaskCreatePinnedToCore(TaskRFID, "TaskRFID", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskFinger, "TaskFinger", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(TaskKeypad, "TaskKeypad", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(TaskMQTT, "TaskMQTT", 4096, NULL, 1, NULL, 0);
+  safeDisplay("System Ready", "");
+  
+  xTaskCreatePinnedToCore(TaskRFID,   "RFID",   4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskFinger, "Finger", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskKeypad, "Keypad", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskMQTT,   "MQTT",   4096, NULL, 1, NULL, 0);
 }
 
-// ---------- Loop ----------
-void loop() {
-  vTaskDelay(pdMS_TO_TICKS(2000));
-}
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
