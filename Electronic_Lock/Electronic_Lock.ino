@@ -9,10 +9,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <time.h>
-
-// ==========================================
 // 1. CẤU HÌNH PHẦN CỨNG
-// ==========================================
 #define RC522_SS   5
 #define RC522_RST  25
 #define OLED_SDA   21
@@ -34,13 +31,10 @@ char keys[ROWS][COLS] = {
 };
 byte rowPins[ROWS] = {13, 12, 14, 27, 26}; 
 byte colPins[COLS] = {15, 4, 32, 33};
-
-// ==========================================
 // 2. CONFIG WIFI & MQTT
-// ==========================================
 const char* ssid          = "VILLA KT 301";
 const char* wifi_password = "buong301@";
-const char* mqtt_server   = "test.mosquitto.org";
+const char* mqtt_server   = "broker.hivemq.com";
 const int   mqtt_port     = 1883;
 
 // Topics
@@ -49,9 +43,7 @@ const char* mqtt_rfid_add_topic   = "esp32/rfid_add";
 const char* mqtt_finger_add_topic = "esp32/finger_add"; 
 const char* mqtt_rfid_add_result  = "esp32/rfid_add_result";
 
-// ==========================================
 // 3. EEPROM LAYOUT
-// ==========================================
 #define EEPROM_SIZE 512
 #define COUNT_ADDR 0
 #define PASSWORD_ADDR 1
@@ -61,9 +53,7 @@ const char* mqtt_rfid_add_result  = "esp32/rfid_add_result";
 #define RECORD_SIZE UID_LEN
 #define MAX_USERS ((EEPROM_SIZE - RECORDS_START) / RECORD_SIZE)
 
-// ==========================================
 // 4. OBJECTS & GLOBALS
-// ==========================================
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 MFRC522 mfrc522(RC522_SS, RC522_RST);
 Adafruit_Fingerprint finger(&Serial2);
@@ -81,9 +71,6 @@ SemaphoreHandle_t displayMutex = NULL;
 QueueHandle_t mqttQueue = NULL;
 struct MQMsg { char txt[128]; };
 
-// ==========================================
-// 5. HELPER FUNCTIONS
-// ==========================================
 
 // --- EEPROM ---
 int getUserCount() {
@@ -186,9 +173,7 @@ void showReady() {
   safeDisplay("READY TO SCAN", "RFID / Finger / Pass");
 }
 
-// ==========================================
 // 6. WIFI & MQTT & CALLBACK
-// ==========================================
 void setup_wifi() {
   Serial.print("WiFi Connecting");
   WiFi.begin(ssid, wifi_password);
@@ -207,12 +192,12 @@ void setup_wifi() {
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // 1. Tạo biến msg từ payload (ĐÃ SỬA LỖI Ở ĐÂY)
+  // Tạo biến msg từ payload
   String msg = "";
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   String t = String(topic);
 
-  // 2. Xử lý logic
+  // Xử lý logic
   if (t == mqtt_rfid_add_topic) {
     addMode = true;
     Serial.println("CMD: Add User Mode ON");
@@ -236,7 +221,7 @@ void reconnectMQTT() {
   if (client.connect(clientId.c_str())) {
     mqttConnected = true; Serial.println("MQTT OK");
     client.subscribe(mqtt_rfid_add_topic);
-    client.subscribe(mqtt_finger_add_topic); // Đừng quên subscribe topic này
+    client.subscribe(mqtt_finger_add_topic);
     safeDisplay("MQTT: Connected", "");
   } else {
     mqttConnected = false;
@@ -244,9 +229,7 @@ void reconnectMQTT() {
   }
 }
 
-// ==========================================
-// 7. FINGERPRINT LOGIC (ENROLLMENT)
-// ==========================================
+// FINGERPRINT LOGIC 
 int getNextFreeID() {
   for (int i = 1; i <= 127; i++) {
     uint8_t p = finger.loadModel(i);
@@ -316,9 +299,7 @@ void enrollFingerFlow() {
   addFingerMode = false; vTaskDelay(2000); showReady();
 }
 
-// ==========================================
 // 8. TASKS
-// ==========================================
 
 void TaskRFID(void *pvParameters) {
   (void) pvParameters;
@@ -430,18 +411,45 @@ void TaskMQTT(void *pvParameters) {
   (void) pvParameters;
   MQMsg recv;
   for (;;) {
-    if (!wifiConnected && WiFi.status() == WL_CONNECTED) wifiConnected = true;
-    if (wifiConnected && !client.connected()) reconnectMQTT();
-    if (client.connected()) client.loop();
-    if (xQueueReceive(mqttQueue, &recv, pdMS_TO_TICKS(100)) == pdTRUE) {
-       if (client.connected()) client.publish(mqtt_topic, recv.txt);
+    // Kiểm tra trạng thái WiFi
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+    } else {
+        wifiConnected = false;
+    }
+
+    // Xử lý kết nối MQTT
+    if (wifiConnected) {
+        if (!client.connected()) {
+            reconnectMQTT();
+            // Nếu connect fail, phải delay 5 giây để tránh spam và nhường CPU
+            if (!client.connected()) { 
+                vTaskDelay(pdMS_TO_TICKS(5000)); 
+            }
+        } else {
+            // Nếu đã connect, gọi loop để duy trì keep-alive
+            client.loop();
+        }
+    } else {
+        // Nếu mất WiFi, đợi 1s rồi check lại
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    //  Xử lý Queue (Chỉ gửi khi có MQTT)
+    // Lưu ý: xQueueReceive đã có timeout 100ms, đây cũng coi là 1 dạng delay ngắn
+    // Nhưng nếu logic trên kia chiếm hết thời gian thì code không chạy xuống đây được.
+    if (client.connected()) {
+        if (xQueueReceive(mqttQueue, &recv, pdMS_TO_TICKS(10)) == pdTRUE) {
+            client.publish(mqtt_topic, recv.txt);
+        }
+    } else {
+        // Nếu không kết nối, xả queue hoặc delay nhẹ để không treo
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
   }
 }
 
-// ==========================================
 // 9. SETUP & LOOP
-// ==========================================
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);

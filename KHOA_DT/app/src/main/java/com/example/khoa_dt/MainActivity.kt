@@ -20,7 +20,7 @@ import java.util.*
 class MainActivity : AppCompatActivity() {
 
     private lateinit var mqttClient: MqttAndroidClient
-    private val brokerUri = "tcp://test.mosquitto.org:1883"
+    private val brokerUri = "tcp://broker.hivemq.com:1883"
 
     // Topics
     private val topicLog = "esp32/lock"
